@@ -1,0 +1,9 @@
+downloads/cookies.txt
+downloads/.usage.json
+downloads/*.mp4
+downloads/*.mp3
+bot.log
+.env
+venv/
+__pycache__/
+*.pyc

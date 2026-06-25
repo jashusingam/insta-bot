@@ -1,0 +1,18 @@
+# ─── Instagram Reel Downloader Bot — Dependencies ───────────────────────────
+# Install with:  pip install -r requirements.txt
+
+# Telegram bot framework (async, v20+)
+python-telegram-bot==22.0
+
+# YouTube-DL fork — actively maintained, supports Instagram
+yt-dlp>=2026.0.0
+
+# HTTP client (used internally by yt-dlp & python-telegram-bot)
+httpx>=0.27.2
+aiohttp>=3.9.0
+
+# Optional: faster JSON parsing
+ujson>=5.9.0
+
+# Optional: progress bars in terminal during testing
+tqdm>=4.66.0
