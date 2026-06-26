@@ -1,6 +1,6 @@
 """
-download_handler.py — Advanced download engine for Instagram Reel Bot
-Handles quality selection, daily quota tracking, progress, and cleanup.
+download_handler.py — Advanced download engine for Instagram and Twitter/X
+Handles fallback format selection, daily quota tracking, progress, and cleanup.
 """
 
 import os
@@ -16,31 +16,26 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 logger = logging.getLogger(__name__)
 
-# ─── Quality Profiles ────────────────────────────────────────────────────────
+# ─── Resilient Quality Profiles ──────────────────────────────────────────────
+# We use cascading formats: try to match your target max height, then fall back
+# to general 'bestvideo+bestaudio', and finally any standalone 'best' format.
 QUALITY_PROFILES = {
-    "1088x720": {
-        "label": "⬇️  1088×720  HD   (~1.4 MB)",
-        "format": "bestvideo[width<=1088][height<=720]+bestaudio/best[width<=1088]",
+    "hd": {
+        "label": "⬇️  HD Quality (Max 720p)",
+        "format": "bestvideo[height<=720]+bestaudio/best[height<=720]/best",
         "ext": "mp4",
-        "width": 1088,
+        "width": None,
         "height": 720,
     },
-    "544x360": {
-        "label": "⬇️  544×360   SD   (~0.75 MB)",
-        "format": "bestvideo[width<=544][height<=360]+bestaudio/best[width<=544]",
+    "sd": {
+        "label": "⬇️  SD Quality (Max 360p)",
+        "format": "bestvideo[height<=360]+bestaudio/best[height<=360]/best",
         "ext": "mp4",
-        "width": 544,
+        "width": None,
         "height": 360,
     },
-    "480x854": {
-        "label": "⬇️  480×854  Story (~0.48 MB)",
-        "format": "bestvideo[width<=480]+bestaudio/best[height<=854]",
-        "ext": "mp4",
-        "width": 480,
-        "height": 854,
-    },
     "audio": {
-        "label": "🎵  Audio only      (~0.24 MB)",
+        "label": "🎵  Audio only",
         "format": "bestaudio/best",
         "ext": "mp3",
         "width": None,
@@ -89,7 +84,8 @@ class DownloadHandler:
         ydl = self._active.pop(uid, None)
         if ydl:
             try:
-                ydl._request_director  # triggers cleanup in yt-dlp
+                # Set stop flag on the running process instance
+                ydl.stop_download()
             except Exception:
                 pass
             return True
@@ -97,7 +93,6 @@ class DownloadHandler:
 
     def build_quality_keyboard(self, meta: dict, uid: int) -> InlineKeyboardMarkup:
         """Build an inline keyboard with all quality options."""
-        used = self.get_daily_usage(uid)
         rows = []
         for key, profile in QUALITY_PROFILES.items():
             rows.append([InlineKeyboardButton(profile["label"], callback_data=f"dl:{key}")])
@@ -115,7 +110,6 @@ class DownloadHandler:
         """
         Download the video at `url` using the chosen quality profile.
         Returns a dict with filepath, size_mb, width, height.
-        Raises on error.
         """
         if quality == "cancel":
             raise ValueError("Download cancelled by user.")
@@ -128,15 +122,7 @@ class DownloadHandler:
         out_name  = f"{user_id}_{ts}.%(ext)s"
         out_path  = self.downloads_dir / out_name
 
-        # Capture the currently-running event loop BEFORE we hop into a worker
-        # thread. yt-dlp's progress_hooks fire from inside run_in_executor's
-        # background thread, which has no event loop of its own — so any
-        # asyncio call there (including asyncio.create_task) would raise
-        # "no running event loop". We hand work back to the real loop via
-        # run_coroutine_threadsafe instead.
         main_loop = asyncio.get_running_loop()
-
-        # Closure to track progress
         pct_holder = [0.0]
 
         def _progress_hook(d):
@@ -146,27 +132,30 @@ class DownloadHandler:
                 total      = d.get("total_bytes") or d.get("total_bytes_estimate") or 1
                 downloaded = d.get("downloaded_bytes", 0)
                 pct        = min(downloaded / total * 100, 99.9)
-                if pct - pct_holder[0] >= 5:  # update every 5 %
+                if pct - pct_holder[0] >= 5:  # update every 5%
                     pct_holder[0] = pct
                     self._safe_progress(main_loop, progress_callback, pct)
             elif d["status"] == "finished":
                 self._safe_progress(main_loop, progress_callback, 100.0)
 
         ydl_opts = {
-            "format"        : profile["format"],
-            "outtmpl"       : str(out_path),
+            "format"             : profile["format"],
+            "outtmpl"            : str(out_path),
             "merge_output_format": "mp4",
-            "quiet"         : True,
-            "no_warnings"   : True,
-            "progress_hooks": [_progress_hook],
-            "socket_timeout": 30,
-            "retries"       : 5,
+            "quiet"              : True,
+            "no_warnings"        : True,
+            "progress_hooks"     : [_progress_hook],
+            "socket_timeout"     : 30,
+            "retries"            : 5,
+            # Twitter and IG need robust user-agents or they geo-block / challenge
             "http_headers"  : {
                 "User-Agent": (
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) "
                     "Chrome/124.0.0.0 Safari/537.36"
-                )
+                ),
+                "Accept": "*/*",
+                "Accept-Language": "en-US,en;q=0.9",
             },
         }
 
@@ -174,11 +163,11 @@ class DownloadHandler:
         if cookies_file and os.path.isfile(cookies_file):
             ydl_opts["cookiefile"] = cookies_file
 
-        # Audio-only post-processing
+        # Extract audio profile settings if selected
         if quality == "audio":
             ydl_opts["postprocessors"] = [{
-                "key"            : "FFmpegExtractAudio",
-                "preferredcodec" : "mp3",
+                "key"             : "FFmpegExtractAudio",
+                "preferredcodec"  : "mp3",
                 "preferredquality": "192",
             }]
 
@@ -198,7 +187,7 @@ class DownloadHandler:
         ext      = profile["ext"]
         filepath = self._find_file(self.downloads_dir, user_id, ts, ext)
         if not filepath:
-            raise FileNotFoundError("Downloaded file not found on disk.")
+            raise FileNotFoundError("Downloaded file was not generated or could not be found.")
 
         size_mb = os.path.getsize(filepath) / (1024 * 1024)
         self._add_usage(user_id, size_mb)
@@ -212,11 +201,6 @@ class DownloadHandler:
 
     @staticmethod
     def _safe_progress(loop: asyncio.AbstractEventLoop, callback: Callable[[float], None], pct: float) -> None:
-        """
-        Called from yt-dlp's worker thread. Schedules `callback(pct)` onto the
-        real event loop thread-safely instead of calling asyncio APIs directly
-        from a thread that has no event loop of its own.
-        """
         try:
             loop.call_soon_threadsafe(callback, pct)
         except Exception as exc:
@@ -227,19 +211,17 @@ class DownloadHandler:
         if filepath and os.path.isfile(filepath):
             try:
                 os.remove(filepath)
-                logger.info("Cleaned up %s", filepath)
+                logger.info("Cleaned up file: %s", filepath)
             except Exception as exc:
                 logger.warning("Cleanup failed for %s: %s", filepath, exc)
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
     def _find_file(self, directory: Path, uid: int, ts: int, ext: str) -> Optional[str]:
-        """Glob for the output file (extension may vary)."""
         prefix = f"{uid}_{ts}"
         for f in directory.iterdir():
             if f.stem == prefix or f.name.startswith(prefix):
                 return str(f)
-        # Fallback: search by ext
         for f in sorted(directory.glob(f"*.{ext}"), key=lambda x: x.stat().st_mtime, reverse=True):
             if str(uid) in f.name:
                 return str(f)
@@ -261,7 +243,6 @@ class DownloadHandler:
             try:
                 with open(self._usage_file) as f:
                     raw = json.load(f)
-                # Convert keys back to int
                 self._usage = {int(k): v for k, v in raw.items()}
                 logger.info("Loaded usage data for %d users.", len(self._usage))
             except Exception as exc:
