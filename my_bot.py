@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 
 # ─── Config ──────────────────────────────────────────────────────────────────
 BOT_TOKEN        = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
-ALLOWED_USERS    = set()                     # Empty = allow all; add int user IDs to restrict
+ALLOWED_USERS    = {1362997526,7509064576}                    # Empty = allow all; add int user IDs to restrict
 MAX_DAILY_MB     = 1024                      # Daily traffic cap per user (MB)
 DOWNLOADS_DIR    = "downloads"
 COOKIES_FILE     = os.path.join(DOWNLOADS_DIR, "cookies.txt")
