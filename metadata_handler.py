@@ -12,8 +12,8 @@ logger = logging.getLogger(__name__)
 
 # Supported Instagram URL patterns
 INSTAGRAM_PATTERNS = [
-    r"https?://(www\.)?instagram\.com/(reel|p|tv)/[\w\-]+/?",
-    r"https?://instagr\.am/(reel|p|tv)/[\w\-]+/?",
+    r"https?://(www\.)?instagram\.com/(reel|p|tv|share)/[\w\-]+/?",
+    r"https?://instagr\.am/(reel|p|tv|share)/[\w\-]+/?",
 ]
 
 # Supported Twitter / X URL patterns
@@ -55,7 +55,7 @@ class MetadataHandler:
 
     async def fetch_metadata(self, url: str, cookies_file: Optional[str] = None) -> dict:
         """
-        Fetch metadata for an Instagram reel/post.
+        Fetch metadata for an Instagram reel/post or Twitter status video.
         Returns a normalised dict with title, uploader, duration, thumbnail, formats, etc.
         Raises on failure.
         """
