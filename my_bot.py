@@ -1,5 +1,5 @@
 """
-Advanced Instagram & Twitter/X Downloader Telegram Bot
+Advanced Instagram Reel Downloader Telegram Bot
 my_bot.py - Main entry point
 """
 
@@ -32,12 +32,21 @@ logger = logging.getLogger(__name__)
 
 # ─── Config ──────────────────────────────────────────────────────────────────
 BOT_TOKEN        = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
-ALLOWED_USERS    = {1362997526,7509064576}                    # Empty = allow all; add int user IDs to restrict
+ALLOWED_USERS    = set()                     # Empty = allow all; add int user IDs to restrict
 MAX_DAILY_MB     = 1024                      # Daily traffic cap per user (MB)
 DOWNLOADS_DIR    = "downloads"
 COOKIES_FILE     = os.path.join(DOWNLOADS_DIR, "cookies.txt")
 
 os.makedirs(DOWNLOADS_DIR, exist_ok=True)
+
+# On cloud hosts (Railway, Render, etc.) there's no easy way to upload a file
+# directly, so we allow supplying the entire cookies.txt content via an
+# environment variable instead. If COOKIES_TXT is set, write it to disk now.
+_cookies_env = os.getenv("COOKIES_TXT")
+if _cookies_env:
+    with open(COOKIES_FILE, "w", encoding="utf-8") as _f:
+        _f.write(_cookies_env)
+    logger.info("Wrote cookies.txt from COOKIES_TXT environment variable.")
 
 # ─── Handlers ────────────────────────────────────────────────────────────────
 download_handler = DownloadHandler(
@@ -55,7 +64,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_html(
         f"👋 Hello <b>{user.first_name}</b>!\n\n"
         "📥 <b>Reel & Video Downloader Bot</b>\n\n"
-        "Send me any <b>Instagram Reel/Post/Share link</b> or <b>Twitter/X video</b> URL "
+        "Send me any <b>Instagram Reel/Post</b> or <b>Twitter/X video</b> URL "
         "and I'll fetch it for you in multiple qualities.\n\n"
         "📋 <b>Commands:</b>\n"
         "/start   — Show this message\n"
@@ -75,10 +84,11 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "2️⃣  Paste it here and send\n"
         "3️⃣  Choose your preferred quality\n"
         "4️⃣  Receive the video or audio file\n\n"
-        "🎬 <b>Available options:</b>\n"
-        "• HD Quality (Max 720p)\n"
-        "• SD Quality (Max 360p)\n"
-        "• 🎵 Audio only\n\n"
+        "🎬 <b>Available qualities:</b>\n"
+        "• 1088×720 HD  (~1.4 MB)\n"
+        "• 544×360 SD   (~0.75 MB)\n"
+        "• 480×854 Story (~0.48 MB)\n"
+        "• 🎵 Audio only (~0.24 MB)\n\n"
         "⚠️ <b>Limits:</b>\n"
         f"• Daily bandwidth: {MAX_DAILY_MB} MB per user\n"
         "• Private accounts require cookies\n\n"
@@ -116,10 +126,10 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 # ── /about ───────────────────────────────────────────────────────────────────
 async def cmd_about(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_html(
-        "🤖 <b>Instagram & Twitter Video Downloader</b>\n\n"
-        "Version : <code>2.1.0</code>\n"
-        "Engine  : <code>yt-dlp Core</code>\n"
-        "Framework: <code>python-telegram-bot 22.x</code>\n\n"
+        "🤖 <b>Instagram Reel Downloader</b>\n\n"
+        "Version : <code>2.0.0</code>\n"
+        "Engine  : <code>yt-dlp</code>\n"
+        "Framework: <code>python-telegram-bot 20.x</code>\n\n"
         "📦 Files:\n"
         "<code>my_bot.py</code>          — Main bot\n"
         "<code>download_handler.py</code> — Download engine\n"
@@ -186,7 +196,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await query.answer()
 
     uid  = query.from_user.id
-    data = query.data  # e.g. "dl:hd" or "dl:audio"
+    data = query.data  # e.g. "dl:1088x720" or "dl:audio"
 
     if not data.startswith("dl:"):
         return
@@ -199,17 +209,19 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.edit_message_text("⚠️ Session expired. Please send the URL again.")
         return
 
-    await query.edit_message_text(f"⏳ Downloading <b>{quality.upper()}</b>…", parse_mode="HTML")
+    await query.edit_message_text(f"⏳ Downloading <b>{quality}</b>…", parse_mode="HTML")
 
     def _on_progress(p: float) -> None:
+        # This now runs on the main event loop thread (scheduled via
+        # call_soon_threadsafe from download_handler), so create_task is safe here.
         async def _update():
             try:
                 await query.edit_message_text(
-                    f"📥 Downloading <b>{quality.upper()}</b>…\n{_progress_bar(p)}  {p:.1f}%",
+                    f"📥 Downloading <b>{quality}</b>…\n{_progress_bar(p)}  {p:.1f}%",
                     parse_mode="HTML",
                 )
             except Exception:
-                # Ignore transient Telegram throttling exceptions during fast edits
+                # Telegram throttles identical/rapid edits — ignore those failures
                 pass
         asyncio.create_task(_update())
 
@@ -233,7 +245,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             f"📹 <b>{meta.get('title', 'Video')}</b>\n"
             f"👤 @{meta.get('uploader', 'unknown')}\n"
             f"⏱ {meta.get('duration_str', '')}\n"
-            f"📦 {result['size_mb']:.2f} MB  |  {quality.upper()}\n\n"
+            f"📦 {result['size_mb']:.2f} MB  |  {quality}\n\n"
             f"🔗 <a href='{url}'>Original</a>"
         )
         if quality == "audio":
@@ -250,6 +262,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 caption=caption,
                 parse_mode="HTML",
                 supports_streaming=True,
+                width=result.get("width"),
+                height=result.get("height"),
             )
         await query.delete_message()
     except Exception as exc:
@@ -294,8 +308,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(handle_callback))
 
     logger.info("Bot is running…")
-    # Added timeout parameter here to leverage native long-polling and fix the log flood
-    app.run_polling(allowed_updates=Update.ALL_TYPES, timeout=30)
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
