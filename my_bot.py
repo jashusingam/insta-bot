@@ -185,4 +185,40 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await query.delete_message()
     download_handler.cleanup(result.get("filepath"))
 
-def
+# ── Helper ────────────────────────────────────────────────────────────────
+def _progress_bar(pct: float, width: int = 10) -> str:
+    filled = int(width * pct / 100)
+    return "█" * filled + "░" * (width - filled)
+
+# ── Bot startup ────────────────────────────────────────────────────────────
+async def post_init(application: Application) -> None:
+    await application.bot.set_my_commands([
+        BotCommand("start",  "Welcome message"),
+        BotCommand("help",   "Usage guide"),
+        BotCommand("status", "Daily usage stats"),
+        BotCommand("cancel", "Cancel current download"),
+        BotCommand("about",  "Bot info"),
+    ])
+    logger.info("Bot commands registered.")
+
+def main() -> None:
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .build()
+    )
+
+    app.add_handler(CommandHandler("start",  cmd_start))
+    app.add_handler(CommandHandler("help",   cmd_help))
+    app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("cancel", cmd_cancel))
+    app.add_handler(CommandHandler("about",  cmd_about))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
+    app.add_handler(CallbackQueryHandler(handle_callback))
+
+    logger.info("Bot is running…")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+if __name__ == "__main__":
+    main()
