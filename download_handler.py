@@ -192,7 +192,12 @@ class DownloadHandler:
 
     def _find_file(self, directory: Path, uid: int, ts: int, ext: str) -> Optional[str]:
         prefix = f"{uid}_{ts}"
+        # First check exact match
         for f in directory.iterdir():
-            if f.stem == prefix or f.name.startswith(prefix): return str(f)
+            if f.stem == prefix or f.name.startswith(prefix):
+                return str(f)
+        # Then check recent files with matching extension
         for f in sorted(directory.glob(f"*.{ext}"), key=lambda x: x.stat().st_mtime, reverse=True):
-            if str(uid)
+            if str(uid) in f.name:
+                return str(f)
+        return None
