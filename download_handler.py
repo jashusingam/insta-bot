@@ -201,3 +201,31 @@ class DownloadHandler:
             if str(uid) in f.name:
                 return str(f)
         return None
+            def _ensure_fresh(self, uid: int) -> None:
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        rec = self._usage.get(uid)
+        if not rec or rec["date"] != today:
+            self._usage[uid] = {"date": today, "used_mb": 0.0}
+
+    def _add_usage(self, uid: int, mb: float) -> None:
+        self._ensure_fresh(uid)
+        self._usage[uid]["used_mb"] += mb
+        self._save_usage()
+
+    def _load_usage(self) -> None:
+        if self._usage_file.exists():
+            try:
+                with open(self._usage_file) as f:
+                    raw = json.load(f)
+                self._usage = {int(k): v for k, v in raw.items()}
+                logger.info("Loaded usage data for %d users.", len(self._usage))
+            except Exception as exc:
+                logger.warning("Could not load usage file: %s", exc)
+
+    def _save_usage(self) -> None:
+        try:
+            with open(self._usage_file, "w") as f:
+                json.dump(self._usage, f, indent=2)
+        except Exception as exc:
+            logger.warning("Could not save usage file: %s", exc)
+
