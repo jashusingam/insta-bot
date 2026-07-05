@@ -1,12 +1,13 @@
 """
-Advanced Instagram Reel Downloader Telegram Bot
-my_bot.py - Main entry point
+Advanced Instagram & Twitter/X Downloader Telegram Bot
+my_bot.py — Main entry point
+Supports: videos (HD/SD/Audio), single photos, carousels (multi-image posts)
 """
 
 import os
 import logging
 import asyncio
-from telegram import Update, BotCommand
+from telegram import Update, BotCommand, InputMediaPhoto
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -18,7 +19,7 @@ from telegram.ext import (
 from download_handler import DownloadHandler
 from metadata_handler import MetadataHandler
 
-# ─── Logging Setup ───────────────────────────────────────────────────────────
+# ─── Logging ─────────────────────────────────────────────────────────────────
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
@@ -31,17 +32,15 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ─── Config ──────────────────────────────────────────────────────────────────
-BOT_TOKEN        = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
-ALLOWED_USERS    = set()                     # Empty = allow all; add int user IDs to restrict
-MAX_DAILY_MB     = 1024                      # Daily traffic cap per user (MB)
-DOWNLOADS_DIR    = "downloads"
-COOKIES_FILE     = os.path.join(DOWNLOADS_DIR, "cookies.txt")
+BOT_TOKEN     = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+ALLOWED_USERS = set()          # Empty = allow all; add int IDs to restrict e.g. {111, 222}
+MAX_DAILY_MB  = 1024
+DOWNLOADS_DIR = "downloads"
+COOKIES_FILE  = os.path.join(DOWNLOADS_DIR, "cookies.txt")
 
 os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 
-# On cloud hosts (Railway, Render, etc.) there's no easy way to upload a file
-# directly, so we allow supplying the entire cookies.txt content via an
-# environment variable instead. If COOKIES_TXT is set, write it to disk now.
+# Write cookies from environment variable if provided (Railway/Render cloud hosting)
 _cookies_env = os.getenv("COOKIES_TXT")
 if _cookies_env:
     with open(COOKIES_FILE, "w", encoding="utf-8") as _f:
@@ -57,15 +56,17 @@ download_handler = DownloadHandler(
 metadata_handler = MetadataHandler()
 
 
-# ── /start ───────────────────────────────────────────────────────────────────
+# ── /start ────────────────────────────────────────────────────────────────────
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     logger.info("User %s (%d) started the bot.", user.first_name, user.id)
     await update.message.reply_html(
         f"👋 Hello <b>{user.first_name}</b>!\n\n"
-        "📥 <b>Reel & Video Downloader Bot</b>\n\n"
-        "Send me any <b>Instagram Reel/Post</b> or <b>Twitter/X video</b> URL "
-        "and I'll fetch it for you in multiple qualities.\n\n"
+        "📥 <b>Media Downloader Bot</b>\n\n"
+        "Send me any <b>Instagram</b> or <b>Twitter/X</b> link and I'll download it for you.\n\n"
+        "🎬 <b>Supports:</b>\n"
+        "• Instagram Reels, Posts, Photos, Carousels\n"
+        "• Twitter/X Videos and Photos\n\n"
         "📋 <b>Commands:</b>\n"
         "/start   — Show this message\n"
         "/help    — Detailed usage guide\n"
@@ -76,28 +77,27 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
-# ── /help ────────────────────────────────────────────────────────────────────
+# ── /help ─────────────────────────────────────────────────────────────────────
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_html(
         "📖 <b>How to use:</b>\n\n"
-        "1️⃣  Copy an Instagram Reel/Post or Twitter/X video URL\n"
+        "1️⃣  Copy an Instagram or Twitter/X link\n"
         "2️⃣  Paste it here and send\n"
-        "3️⃣  Choose your preferred quality\n"
-        "4️⃣  Receive the video or audio file\n\n"
-        "🎬 <b>Available qualities:</b>\n"
-        "• 1088×720 HD  (~1.4 MB)\n"
-        "• 544×360 SD   (~0.75 MB)\n"
-        "• 480×854 Story (~0.48 MB)\n"
-        "• 🎵 Audio only (~0.24 MB)\n\n"
-        "⚠️ <b>Limits:</b>\n"
-        f"• Daily bandwidth: {MAX_DAILY_MB} MB per user\n"
-        "• Private accounts require cookies\n\n"
-        "🍪 <b>Private content?</b>\n"
-        "Ask the admin to add your Instagram cookies."
+        "3️⃣  For videos: choose your quality\n"
+        "    For photos: sent automatically\n\n"
+        "🎬 <b>Video qualities:</b>\n"
+        "• HD  — up to 720p\n"
+        "• SD  — up to 360p\n"
+        "• 🎵 Audio only (MP3)\n\n"
+        "🖼 <b>Photo support:</b>\n"
+        "• Single photos downloaded instantly\n"
+        "• Carousels send all images at once (up to 10)\n\n"
+        f"⚠️ Daily limit: {MAX_DAILY_MB} MB per user\n"
+        "Resets at midnight UTC 🌙"
     )
 
 
-# ── /status ──────────────────────────────────────────────────────────────────
+# ── /status ───────────────────────────────────────────────────────────────────
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     uid  = update.effective_user.id
     used = download_handler.get_daily_usage(uid)
@@ -113,9 +113,9 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     )
 
 
-# ── /cancel ──────────────────────────────────────────────────────────────────
+# ── /cancel ───────────────────────────────────────────────────────────────────
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    uid = update.effective_user.id
+    uid       = update.effective_user.id
     cancelled = download_handler.cancel_download(uid)
     if cancelled:
         await update.message.reply_text("❌ Download cancelled.")
@@ -123,19 +123,20 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text("ℹ️ No active download to cancel.")
 
 
-# ── /about ───────────────────────────────────────────────────────────────────
+# ── /about ────────────────────────────────────────────────────────────────────
 async def cmd_about(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_html(
-        "🤖 <b>Instagram Reel Downloader</b>\n\n"
-        "Version : <code>2.0.0</code>\n"
-        "Engine  : <code>yt-dlp</code>\n"
-        "Framework: <code>python-telegram-bot 20.x</code>\n\n"
-        "📦 Files:\n"
-        "<code>my_bot.py</code>          — Main bot\n"
-        "<code>download_handler.py</code> — Download engine\n"
-        "<code>metadata_handler.py</code> — Metadata parser\n"
-        "<code>downloads/</code>          — Temp storage\n"
-        "<code>downloads/cookies.txt</code> — Auth cookies\n"
+        "🤖 <b>Media Downloader Bot</b>\n\n"
+        "Version  : <code>3.0.0</code>\n"
+        "Engine   : <code>yt-dlp</code>\n"
+        "Framework: <code>python-telegram-bot</code>\n\n"
+        "📦 <b>Supports:</b>\n"
+        "• Instagram — Reels, Posts, Photos, Carousels\n"
+        "• Twitter/X — Videos and Photos\n\n"
+        "📁 <b>Files:</b>\n"
+        "<code>my_bot.py</code>           — Main bot\n"
+        "<code>download_handler.py</code>  — Download engine\n"
+        "<code>metadata_handler.py</code>  — Metadata parser\n"
     )
 
 
@@ -154,7 +155,7 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text(
             "⚠️ That doesn't look like a supported link.\n\n"
             "I can download from:\n"
-            "• Instagram — <code>instagram.com/reel/ABC123/</code>\n"
+            "• Instagram — <code>instagram.com/p/ABC123/</code>\n"
             "• Twitter/X — <code>x.com/user/status/12345</code>",
             parse_mode="HTML",
         )
@@ -169,16 +170,24 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         )
         return
 
-    # Fetch metadata & show quality picker
-    status_msg = await update.message.reply_text("🔍 Fetching video info…")
+    # Fetch metadata
+    status_msg = await update.message.reply_text("🔍 Fetching media info…")
     try:
         meta = await metadata_handler.fetch_metadata(text, COOKIES_FILE)
     except Exception as exc:
         logger.error("Metadata error: %s", exc)
-        await status_msg.edit_text(f"❌ Could not fetch video info.\n<code>{exc}</code>", parse_mode="HTML")
+        await status_msg.edit_text(
+            f"❌ Could not fetch media info.\n<code>{exc}</code>",
+            parse_mode="HTML",
+        )
         return
 
-    # Store URL in user_data for callback
+    # ── PHOTO / IMAGE branch ──────────────────────────────────────────────────
+    if meta.get("is_photo"):
+        await _handle_photo(update, context, status_msg, text, meta, uid)
+        return
+
+    # ── VIDEO branch — show quality keyboard ──────────────────────────────────
     context.user_data["pending_url"]  = text
     context.user_data["pending_meta"] = meta
 
@@ -190,14 +199,95 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     )
 
 
-# ── Callback: quality chosen ──────────────────────────────────────────────────
+# ── Photo download & send ─────────────────────────────────────────────────────
+async def _handle_photo(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    status_msg,
+    url: str,
+    meta: dict,
+    uid: int,
+) -> None:
+    """Download photo(s) and send them directly — no quality selection needed."""
+    photo_count = meta.get("photo_count", 1)
+    used        = download_handler.get_daily_usage(uid)
+
+    await status_msg.edit_text(
+        metadata_handler.format_photo_message(meta, used, MAX_DAILY_MB),
+        parse_mode="HTML",
+    )
+
+    try:
+        results = await download_handler.download_image(
+            url=url,
+            user_id=uid,
+            cookies_file=COOKIES_FILE,
+        )
+    except Exception as exc:
+        logger.error("Image download error for uid=%d: %s", uid, exc)
+        await status_msg.edit_text(
+            f"❌ Image download failed.\n<code>{exc}</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    await status_msg.edit_text("📤 Sending…")
+
+    caption = (
+        f"🖼 <b>{meta.get('title', 'Photo')}</b>\n"
+        f"👤 @{meta.get('uploader', 'unknown')}\n"
+        f"🔗 <a href='{url}'>Original</a>"
+    )
+
+    try:
+        if len(results) == 1:
+            # Single photo
+            await update.message.reply_photo(
+                photo=open(results[0]["filepath"], "rb"),
+                caption=caption,
+                parse_mode="HTML",
+            )
+        else:
+            # Carousel — send as media group (Telegram supports up to 10)
+            # Trim to 10 just in case
+            batch = results[:10]
+            media_group = []
+            for i, r in enumerate(batch):
+                media_group.append(
+                    InputMediaPhoto(
+                        media=open(r["filepath"], "rb"),
+                        caption=caption if i == 0 else None,
+                        parse_mode="HTML" if i == 0 else None,
+                    )
+                )
+            await update.message.reply_media_group(media=media_group)
+
+            # If carousel had more than 10, mention it
+            if len(results) > 10:
+                await update.message.reply_text(
+                    f"ℹ️ This carousel has {len(results)} images. "
+                    "Telegram limits media groups to 10, so only the first 10 were sent."
+                )
+
+        await status_msg.delete()
+
+    except Exception as exc:
+        logger.error("Photo send error for uid=%d: %s", uid, exc)
+        await status_msg.edit_text(
+            f"❌ Could not send image(s).\n<code>{exc}</code>",
+            parse_mode="HTML",
+        )
+    finally:
+        download_handler.cleanup_list(results)
+
+
+# ── Callback: quality chosen (video) ─────────────────────────────────────────
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
 
-    uid  = query.from_user.id
-    data = query.data  # e.g. "dl:1088x720" or "dl:audio"
-
+    uid     = query.from_user.id
+    data    = query.data
     if not data.startswith("dl:"):
         return
 
@@ -209,19 +299,24 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.edit_message_text("⚠️ Session expired. Please send the URL again.")
         return
 
-    await query.edit_message_text(f"⏳ Downloading <b>{quality}</b>…", parse_mode="HTML")
+    if quality == "cancel":
+        download_handler.cancel_download(uid)
+        await query.edit_message_text("❌ Cancelled.")
+        return
+
+    await query.edit_message_text(
+        f"⏳ Downloading <b>{quality.upper()}</b>…", parse_mode="HTML"
+    )
 
     def _on_progress(p: float) -> None:
-        # This now runs on the main event loop thread (scheduled via
-        # call_soon_threadsafe from download_handler), so create_task is safe here.
         async def _update():
             try:
                 await query.edit_message_text(
-                    f"📥 Downloading <b>{quality}</b>…\n{_progress_bar(p)}  {p:.1f}%",
+                    f"📥 Downloading <b>{quality.upper()}</b>…\n"
+                    f"{_progress_bar(p)}  {p:.1f}%",
                     parse_mode="HTML",
                 )
             except Exception:
-                # Telegram throttles identical/rapid edits — ignore those failures
                 pass
         asyncio.create_task(_update())
 
@@ -235,7 +330,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
     except Exception as exc:
         logger.error("Download error for uid=%d: %s", uid, exc)
-        await query.edit_message_text(f"❌ Download failed.\n<code>{exc}</code>", parse_mode="HTML")
+        await query.edit_message_text(
+            f"❌ Download failed.\n<code>{exc}</code>", parse_mode="HTML"
+        )
         return
 
     await query.edit_message_text("📤 Uploading to Telegram…")
@@ -245,7 +342,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             f"📹 <b>{meta.get('title', 'Video')}</b>\n"
             f"👤 @{meta.get('uploader', 'unknown')}\n"
             f"⏱ {meta.get('duration_str', '')}\n"
-            f"📦 {result['size_mb']:.2f} MB  |  {quality}\n\n"
+            f"📦 {result['size_mb']:.2f} MB  |  {quality.upper()}\n\n"
             f"🔗 <a href='{url}'>Original</a>"
         )
         if quality == "audio":
@@ -266,20 +363,23 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 height=result.get("height"),
             )
         await query.delete_message()
+
     except Exception as exc:
         logger.error("Upload error: %s", exc)
-        await query.edit_message_text(f"❌ Upload failed.\n<code>{exc}</code>", parse_mode="HTML")
+        await query.edit_message_text(
+            f"❌ Upload failed.\n<code>{exc}</code>", parse_mode="HTML"
+        )
     finally:
         download_handler.cleanup(result.get("filepath"))
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Helper ────────────────────────────────────────────────────────────────────
 def _progress_bar(pct: float, width: int = 10) -> str:
     filled = int(width * pct / 100)
     return "█" * filled + "░" * (width - filled)
 
 
-# ── Bot setup & run ───────────────────────────────────────────────────────────
+# ── Bot startup ───────────────────────────────────────────────────────────────
 async def post_init(application: Application) -> None:
     await application.bot.set_my_commands([
         BotCommand("start",  "Welcome message"),
