@@ -58,8 +58,6 @@ class MetadataHandler:
             "skip_download"         : True,
             "socket_timeout"        : 20,
             "http_headers"          : _COMMON_HEADERS,
-            # Don't raise an error when a post has no video formats (e.g. photo posts).
-            # yt-dlp still returns the full info dict — we detect is_photo from ext/formats.
             "ignore_no_formats_error": True,
         }
         if cookies_file:
@@ -101,18 +99,6 @@ class MetadataHandler:
 
     @staticmethod
     def _detect_photo(info: dict) -> tuple:
-        """
-        Determine if the yt-dlp info dict represents a photo/image (vs a video).
-        Returns (is_photo: bool, count: int).
-
-        Detection order (most → least reliable):
-          1. Top-level 'ext' is an image extension
-          2. Top-level URL itself has an image extension
-          3. Formats list has no video codec
-          4. Playlist where entries look like images
-        """
-
-        # ── Carousel / playlist ───────────────────────────────────────────────
         if info.get("_type") == "playlist":
             entries = [e for e in (info.get("entries") or []) if e]
             image_entries = 0
@@ -135,23 +121,18 @@ class MetadataHandler:
                 return True, image_entries
             return False, 0
 
-        # ── Single entry ──────────────────────────────────────────────────────
-
-        # 1. Top-level ext (most reliable signal for Instagram photos)
         ext = (info.get("ext") or "").lower()
         if ext in IMAGE_EXTS:
             return True, 1
         if ext in VIDEO_EXTS:
             return False, 0
 
-        # 2. Top-level URL has an image extension
         top_url = info.get("url") or ""
         if top_url:
             url_ext = top_url.split("?")[0].rsplit(".", 1)[-1].lower()
             if url_ext in IMAGE_EXTS:
                 return True, 1
 
-        # 3. Formats: if none have a real video codec → photo
         formats = info.get("formats") or []
         if formats:
             has_real_video = any(
@@ -161,7 +142,6 @@ class MetadataHandler:
             if not has_real_video:
                 return True, 1
 
-        # 4. No formats at all and not a known video ext → assume photo
         if not formats and ext not in VIDEO_EXTS:
             return True, 1
 
@@ -204,10 +184,8 @@ class MetadataHandler:
                 })
         return out
 
-    # ── Message formatters ────────────────────────────────────────────────────
-
     @staticmethod
-    def format_meta_message(meta: dict, used_mb: float, max_mb: float) -> str:
+    def format_meta_message(meta: dict, used_mb: float = 0, max_mb: float = 100) -> str:
         lines = [f"🎬 <b>{meta['title']}</b>", f"👤  @{meta['uploader']}"]
         if meta["duration"]:
             lines.append(f"⏱  Duration: <code>{meta['duration_str']}</code>")
@@ -217,17 +195,10 @@ class MetadataHandler:
             lines.append(f"👁  Views: {meta['view_count']:,}")
         if meta["like_count"] is not None:
             lines.append(f"❤️  Likes: {meta['like_count']:,}")
-        remaining = max(0, max_mb - used_mb)
-        lines += [
-            "",
-            f"📊  Daily quota: <b>{used_mb:.1f} / {max_mb} MB</b>  (left: {remaining:.1f} MB)",
-            "",
-            "🎚  <b>Choose quality:</b>",
-        ]
         return "\n".join(lines)
 
     @staticmethod
-    def format_photo_message(meta: dict, used_mb: float, max_mb: float) -> str:
+    def format_photo_message(meta: dict, used_mb: float = 0, max_mb: float = 100) -> str:
         count = meta.get("photo_count", 1)
         label = f"{count} photo{'s' if count > 1 else ''}"
         lines = [
@@ -239,11 +210,4 @@ class MetadataHandler:
             lines.append(f"📅  Uploaded: {meta['upload_date']}")
         if meta["like_count"] is not None:
             lines.append(f"❤️  Likes: {meta['like_count']:,}")
-        remaining = max(0, max_mb - used_mb)
-        lines += [
-            "",
-            f"📊  Daily quota: <b>{used_mb:.1f} / {max_mb} MB</b>  (left: {remaining:.1f} MB)",
-            "",
-            "⏳  Downloading…",
-        ]
         return "\n".join(lines)
