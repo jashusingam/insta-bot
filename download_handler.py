@@ -9,7 +9,6 @@ import logging
 from pathlib import Path
 from typing import Optional, Union
 import time
-import asyncio
 
 logger = logging.getLogger(__name__)
 
@@ -30,8 +29,6 @@ class MediaDownloader:
         Returns: 'video', 'photo', or 'unknown'
         """
         try:
-            timestamp = int(time.time())
-            
             # Use yt-dlp to extract info (without downloading)
             cmd = [
                 'yt-dlp',
@@ -48,25 +45,20 @@ class MediaDownloader:
                 try:
                     info = json.loads(result.stdout)
                     
-                    # Check formats for video codec
                     formats = info.get('formats', [])
                     has_video = False
                     has_image = False
                     
                     for fmt in formats:
                         vcodec = fmt.get('vcodec', 'none')
-                        acodec = fmt.get('acodec', 'none')
                         ext = fmt.get('ext', '').lower()
                         
-                        # Video codec present
                         if vcodec and vcodec != 'none':
                             has_video = True
                         
-                        # Image extension detected
                         if ext in ['jpg', 'jpeg', 'png', 'webp', 'gif']:
                             has_image = True
                     
-                    # Check top-level extension
                     ext = info.get('ext', '').lower()
                     if ext in ['jpg', 'jpeg', 'png', 'webp', 'gif']:
                         return 'photo'
@@ -76,14 +68,14 @@ class MediaDownloader:
                     if has_image:
                         return 'photo'
                     
-                    # Check for carousel/playlist (Instagram carousel posts)
                     if info.get('_type') == 'playlist':
                         entries = info.get('entries', [])
                         if entries:
                             first_entry = entries[0]
-                            first_ext = first_entry.get('ext', '').lower()
-                            if first_ext in ['jpg', 'jpeg', 'png', 'webp', 'gif']:
-                                return 'photo'
+                            if first_entry:
+                                first_ext = first_entry.get('ext', '').lower()
+                                if first_ext in ['jpg', 'jpeg', 'png', 'webp', 'gif']:
+                                    return 'photo'
                             return 'video'
                     
                     return 'video'  # Default to video
@@ -95,17 +87,11 @@ class MediaDownloader:
         except Exception as e:
             logger.error(f"Error detecting media type: {e}")
             return 'unknown'
+        return 'unknown'
     
     def download_video(self, url: str, format_type: str = 'mp4') -> Optional[str]:
         """
         Download media as MP4 video or MP3 audio
-        
-        Args:
-            url: Direct link to Instagram video, Twitter video, YouTube, etc.
-            format_type: 'mp4' for video, 'mp3' for audio
-            
-        Returns:
-            Path to downloaded file or None if failed
         """
         try:
             timestamp = int(time.time())
@@ -155,18 +141,9 @@ class MediaDownloader:
     def download_photo(self, url: str) -> Optional[list]:
         """
         Download photo(s) from Instagram post
-        Handles single photos and carousels (multi-image posts)
-        
-        Args:
-            url: Instagram photo/carousel URL
-            
-        Returns:
-            List of file paths or None if failed
         """
         try:
             timestamp = int(time.time())
-            
-            # Extract photo URLs using yt-dlp with special handling
             cmd = [
                 'yt-dlp',
                 '--dump-json',
@@ -186,22 +163,20 @@ class MediaDownloader:
             import json
             try:
                 info = json.loads(result.stdout)
-            except:
+            except Exception:
                 logger.error("Could not parse JSON output")
                 return None
             
             photo_urls = []
             
-            # Handle carousel (playlist of photos)
-            if info.get('_type') == 'playlist':
+            if info.get('_type') == "playlist":
                 entries = info.get('entries', [])
                 logger.info(f"Found carousel with {len(entries)} items")
-                for i, entry in enumerate(entries):
-                    url_from_entry = entry.get('url') or entry.get('webpage_url')
-                    if url_from_entry:
-                        photo_urls.append(url_from_entry)
-            
-            # Handle single photo
+                for entry in entries:
+                    if entry:
+                        url_from_entry = entry.get('url') or entry.get('webpage_url')
+                        if url_from_entry:
+                            photo_urls.append(url_from_entry)
             else:
                 photo_url = info.get('url')
                 if photo_url:
@@ -211,12 +186,10 @@ class MediaDownloader:
                 logger.error("No photo URLs found")
                 return None
             
-            # Download each photo using wget or curl (direct download)
             downloaded_files = []
             
             for i, photo_url in enumerate(photo_urls[:10]):  # Limit to 10 photos
                 try:
-                    # Determine file extension
                     ext = 'jpg'
                     if '.png' in photo_url:
                         ext = 'png'
@@ -227,20 +200,17 @@ class MediaDownloader:
                     
                     file_path = self.download_dir / f"photo_{timestamp}_{i+1:02d}.{ext}"
                     
-                    # Download with curl (more reliable for images)
                     download_cmd = [
-                        'curl',
-                        '-L',
-                        '-o', str(file_path),
+                        'curl', '-L', '-o', str(file_path),
                         '--connect-timeout', '10',
                         '--max-time', '30',
                         '-A', 'Mozilla/5.0',
                         photo_url
                     ]
                     
-                    result = subprocess.run(download_cmd, capture_output=True, timeout=35)
+                    res = subprocess.run(download_cmd, capture_output=True, timeout=35)
                     
-                    if result.returncode == 0 and file_path.exists():
+                    if res.returncode == 0 and file_path.exists():
                         size_mb = os.path.getsize(file_path) / (1024 * 1024)
                         logger.info(f"Downloaded photo {i+1}: {file_path} ({size_mb:.2f} MB)")
                         downloaded_files.append(str(file_path))
@@ -261,14 +231,6 @@ class MediaDownloader:
             return None
     
     def download(self, url: str, format_type: str = 'mp4') -> Optional[Union[str, list]]:
-        """
-        Auto-detect and download (video or photo)
-        
-        Returns:
-            - For videos/audio: str (file path)
-            - For photos: list (file paths)
-            - None if failed
-        """
         logger.info(f"Auto-detecting media type for: {url}")
         media_type = self.detect_media_type(url)
         logger.info(f"Detected type: {media_type}")
