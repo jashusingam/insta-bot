@@ -1,17 +1,19 @@
 """
-Complete Telegram Media Downloader Bot - FIXED VERSION
+Complete Telegram Media Downloader Bot
 Download MP4/MP3 from Instagram, Twitter/X, YouTube, TikTok, and 900+ sites
 HANDLES BOTH VIDEOS AND PHOTOS CORRECTLY
 """
 
+import os
+import logging
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.ext import (
     Application, MessageHandler, ContextTypes, filters, 
     CallbackQueryHandler, CommandHandler
 )
-from download_handler_FIXED import MediaDownloader
-import os
-import logging
+# Fixed the ModuleNotFoundError import statement here:
+from download_handler import MediaDownloader
+from metadata_handler import MetadataHandler
 
 # Setup logging
 logging.basicConfig(
@@ -28,8 +30,9 @@ TOKEN = 'YOUR_BOT_TOKEN_HERE'  # 🔴 REPLACE WITH YOUR TOKEN
 
 os.makedirs("downloads", exist_ok=True)
 
-# Initialize downloader
+# Initialize handlers
 downloader = MediaDownloader()
+metadata_helper = MetadataHandler()
 
 # Store URLs in memory (user_id_message_id -> url)
 user_urls = {}
@@ -128,9 +131,17 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
+        # Pull rich info from Metadata Handler if supported
+        try:
+            meta = await metadata_helper.fetch_metadata(url)
+            caption = metadata_helper.format_meta_message(meta) + "\n\n📥 Choose download format:"
+        except Exception:
+            caption = "📥 Choose download format:"
+
         await status_msg.edit_text(
-            "📥 Choose download format:",
-            reply_markup=reply_markup
+            text=caption,
+            reply_markup=reply_markup,
+            parse_mode="HTML"
         )
 
 
@@ -172,14 +183,12 @@ async def handle_photo_download(status_msg, url: str, user_id: int):
             media_group = []
             for i, file_path in enumerate(files[:10]):  # Max 10
                 with open(file_path, 'rb') as f:
-                    from io import BytesIO
                     content = f.read()
-                    # Create InputMediaPhoto
                     media_group.append(InputMediaPhoto(content))
             
             if media_group:
                 await status_msg.message.reply_media_group(media_group)
-                await status_msg.edit_text(f"✅ Carousel with {len(files)} photos downloaded!")
+                await status_msg.message.reply_text(f"✅ Carousel with {len(files)} photos downloaded!")
         
         await status_msg.delete()
         
@@ -327,14 +336,6 @@ def main():
     # Check if token is set
     if TOKEN == 'YOUR_BOT_TOKEN_HERE':
         print("❌ ERROR: Please set your TELEGRAM_BOT_TOKEN!")
-        print("\nHow to get your bot token:")
-        print("1. Open Telegram and search for @BotFather")
-        print("2. Send /newbot")
-        print("3. Follow the instructions")
-        print("4. Copy your token and replace 'YOUR_BOT_TOKEN_HERE' in this file")
-        print("\nOr use environment variable:")
-        print("   export BOT_TOKEN='your-token-here'")
-        print("   python my_bot.py")
         return
     
     # Create bot application
@@ -357,15 +358,6 @@ def main():
     
     # Start bot
     logger.info("🤖 Bot is starting...")
-    logger.info("Press Ctrl+C to stop")
-    print("\n" + "="*50)
-    print("🤖 TELEGRAM MEDIA DOWNLOADER BOT")
-    print("="*50)
-    print("✅ Bot is running!")
-    print("📱 Send a link to start downloading")
-    print("⏸️  Press Ctrl+C to stop")
-    print("="*50 + "\n")
-    
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
