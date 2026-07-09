@@ -1,393 +1,293 @@
 """
-download_handler.py — Download engine for Instagram and Twitter/X
-Handles videos, single photos, carousels, daily quota, progress, and cleanup.
-
-Key design for images:
-  yt-dlp is used ONLY to extract direct URLs (skip_download=True).
-  httpx then downloads the image bytes directly.
-  This avoids the "No video formats found" error that occurs when yt-dlp's
-  download path tries to apply video format selection to a photo post.
+download_handler.py - Download videos AND photos from Instagram, Twitter/X
+Properly separates video and image handling
 """
 
+import subprocess
 import os
-import asyncio
 import logging
-import json
-import time
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Optional
-import yt_dlp
-import httpx
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from typing import Optional, Union
+import time
+import asyncio
 
 logger = logging.getLogger(__name__)
 
-IMAGE_EXTS = {'jpg', 'jpeg', 'png', 'webp', 'gif'}
-
-QUALITY_PROFILES = {
-    "hd": {
-        "label" : "⬇️  HD Quality (Max 720p)",
-        "format": "bestvideo[height<=720]+bestaudio/best[height<=720]/best",
-        "ext"   : "mp4",
-        "width" : None,
-        "height": 720,
-    },
-    "sd": {
-        "label" : "⬇️  SD Quality (Max 360p)",
-        "format": "bestvideo[height<=360]+bestaudio/best[height<=360]/best",
-        "ext"   : "mp4",
-        "width" : None,
-        "height": 360,
-    },
-    "audio": {
-        "label" : "🎵  Audio only",
-        "format": "bestaudio/best",
-        "ext"   : "mp3",
-        "width" : None,
-        "height": None,
-    },
-}
-
-_COMMON_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept"         : "*/*",
-    "Accept-Language": "en-US,en;q=0.9",
-}
+DOWNLOADS_DIR = Path("downloads")
+DOWNLOADS_DIR.mkdir(exist_ok=True)
 
 
-def _best_image_url(entry: dict) -> tuple:
-    """
-    Extract the best direct image URL and file extension from a yt-dlp info entry.
-    Returns (url: str | None, ext: str).
-    Priority: image-typed format → top-level url → thumbnail.
-    """
-    # 1. Look through formats for an image-typed one, pick highest quality
-    formats = entry.get("formats") or []
-    image_fmts = [
-        f for f in formats
-        if (f.get("ext") or "").lower() in IMAGE_EXTS and f.get("url")
-    ]
-    if image_fmts:
-        best = max(
-            image_fmts,
-            key=lambda f: (
-                f.get("filesize") or
-                f.get("filesize_approx") or
-                (f.get("width") or 0) * (f.get("height") or 0) or
-                0
-            ),
-        )
-        return best["url"], (best.get("ext") or "jpg").lower()
-
-    # 2. Top-level URL whose extension looks like an image
-    top_url = entry.get("url") or ""
-    top_ext = (entry.get("ext") or "").lower()
-    if top_url and top_ext in IMAGE_EXTS:
-        return top_url, top_ext
-    if top_url:
-        url_ext = top_url.split("?")[0].rsplit(".", 1)[-1].lower()
-        if url_ext in IMAGE_EXTS:
-            return top_url, url_ext
-
-    # 3. Fall back to thumbnail (lower res but guaranteed to be an image)
-    thumbnail = entry.get("thumbnail") or ""
-    if thumbnail:
-        thumb_ext = thumbnail.split("?")[0].rsplit(".", 1)[-1].lower()
-        if thumb_ext not in IMAGE_EXTS:
-            thumb_ext = "jpg"
-        logger.info("Using thumbnail as image source (best available for this entry)")
-        return thumbnail, thumb_ext
-
-    return None, "jpg"
-
-
-class DownloadHandler:
-
-    def __init__(
-        self,
-        downloads_dir: str  = "downloads",
-        cookies_file: str   = "downloads/cookies.txt",
-        max_daily_mb: float = 1024.0,
-    ):
-        self.downloads_dir = Path(downloads_dir)
-        self.cookies_file  = cookies_file
-        self.max_daily_mb  = max_daily_mb
-
-        self.downloads_dir.mkdir(parents=True, exist_ok=True)
-
-        self._usage: dict[int, dict] = {}
-        self._active: dict[int, yt_dlp.YoutubeDL] = {}
-
-        self._usage_file = self.downloads_dir / ".usage.json"
-        self._load_usage()
-
-    # ── Public API ────────────────────────────────────────────────────────────
-
-    def get_daily_usage(self, uid: int) -> float:
-        self._ensure_fresh(uid)
-        return self._usage.get(uid, {}).get("used_mb", 0.0)
-
-    def cancel_download(self, uid: int) -> bool:
-        ydl = self._active.pop(uid, None)
-        if ydl:
-            try:
-                ydl.stop_download()
-            except Exception:
-                pass
-            return True
-        return False
-
-    def build_quality_keyboard(self, meta: dict, uid: int) -> InlineKeyboardMarkup:
-        rows = [
-            [InlineKeyboardButton(profile["label"], callback_data=f"dl:{key}")]
-            for key, profile in QUALITY_PROFILES.items()
-        ]
-        rows.append([InlineKeyboardButton("❌  Cancel", callback_data="dl:cancel")])
-        return InlineKeyboardMarkup(rows)
-
-    # ── Video download ────────────────────────────────────────────────────────
-
-    async def download(
-        self,
-        url: str,
-        quality: str,
-        user_id: int,
-        cookies_file: str,
-        progress_callback: Optional[Callable[[float], None]] = None,
-    ) -> dict:
-        if quality == "cancel":
-            raise ValueError("Download cancelled by user.")
-
-        profile = QUALITY_PROFILES.get(quality)
-        if not profile:
-            raise ValueError(f"Unknown quality: {quality}")
-
-        ts       = int(time.time())
-        out_path = self.downloads_dir / f"{user_id}_{ts}.%(ext)s"
-
-        main_loop  = asyncio.get_running_loop()
-        pct_holder = [0.0]
-
-        def _progress_hook(d):
-            if not progress_callback:
-                return
-            if d["status"] == "downloading":
-                total      = d.get("total_bytes") or d.get("total_bytes_estimate") or 1
-                downloaded = d.get("downloaded_bytes", 0)
-                pct        = min(downloaded / total * 100, 99.9)
-                if pct - pct_holder[0] >= 5:
-                    pct_holder[0] = pct
-                    self._safe_progress(main_loop, progress_callback, pct)
-            elif d["status"] == "finished":
-                self._safe_progress(main_loop, progress_callback, 100.0)
-
-        ydl_opts = {
-            "format"             : profile["format"],
-            "outtmpl"            : str(out_path),
-            "merge_output_format": "mp4",
-            "quiet"              : True,
-            "no_warnings"        : True,
-            "progress_hooks"     : [_progress_hook],
-            "socket_timeout"     : 30,
-            "retries"            : 5,
-            "http_headers"       : _COMMON_HEADERS,
-        }
-
-        if cookies_file and os.path.isfile(cookies_file):
-            ydl_opts["cookiefile"] = cookies_file
-
-        if quality == "audio":
-            ydl_opts["postprocessors"] = [{
-                "key"             : "FFmpegExtractAudio",
-                "preferredcodec"  : "mp3",
-                "preferredquality": "192",
-            }]
-
-        loop = asyncio.get_event_loop()
-
-        def _run():
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                self._active[user_id] = ydl
+class MediaDownloader:
+    """Handle downloads from Instagram, Twitter, YouTube, and other platforms"""
+    
+    def __init__(self, download_dir: Path = DOWNLOADS_DIR):
+        self.download_dir = download_dir
+        self.download_dir.mkdir(exist_ok=True)
+    
+    def detect_media_type(self, url: str) -> str:
+        """
+        Detect if URL contains video or photo
+        Returns: 'video', 'photo', or 'unknown'
+        """
+        try:
+            timestamp = int(time.time())
+            
+            # Use yt-dlp to extract info (without downloading)
+            cmd = [
+                'yt-dlp',
+                '--dump-json',
+                '--skip-download',
+                '--socket-timeout', '10',
+                url
+            ]
+            
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+            
+            if result.returncode == 0:
+                import json
                 try:
-                    ydl.download([url])
-                finally:
-                    self._active.pop(user_id, None)
-
-        await loop.run_in_executor(None, _run)
-
-        filepath = self._find_file(self.downloads_dir, user_id, ts, profile["ext"])
-        if not filepath:
-            raise FileNotFoundError("Downloaded file was not found.")
-
-        size_mb = os.path.getsize(filepath) / (1024 * 1024)
-        self._add_usage(user_id, size_mb)
-
-        return {
-            "filepath": filepath,
-            "size_mb" : size_mb,
-            "width"   : profile["width"],
-            "height"  : profile["height"],
-        }
-
-    # ── Image / photo download ────────────────────────────────────────────────
-
-    async def download_image(
-        self,
-        url: str,
-        user_id: int,
-        cookies_file: str,
-    ) -> list:
+                    info = json.loads(result.stdout)
+                    
+                    # Check formats for video codec
+                    formats = info.get('formats', [])
+                    has_video = False
+                    has_image = False
+                    
+                    for fmt in formats:
+                        vcodec = fmt.get('vcodec', 'none')
+                        acodec = fmt.get('acodec', 'none')
+                        ext = fmt.get('ext', '').lower()
+                        
+                        # Video codec present
+                        if vcodec and vcodec != 'none':
+                            has_video = True
+                        
+                        # Image extension detected
+                        if ext in ['jpg', 'jpeg', 'png', 'webp', 'gif']:
+                            has_image = True
+                    
+                    # Check top-level extension
+                    ext = info.get('ext', '').lower()
+                    if ext in ['jpg', 'jpeg', 'png', 'webp', 'gif']:
+                        return 'photo'
+                    
+                    if has_video:
+                        return 'video'
+                    if has_image:
+                        return 'photo'
+                    
+                    # Check for carousel/playlist (Instagram carousel posts)
+                    if info.get('_type') == 'playlist':
+                        entries = info.get('entries', [])
+                        if entries:
+                            first_entry = entries[0]
+                            first_ext = first_entry.get('ext', '').lower()
+                            if first_ext in ['jpg', 'jpeg', 'png', 'webp', 'gif']:
+                                return 'photo'
+                            return 'video'
+                    
+                    return 'video'  # Default to video
+                    
+                except json.JSONDecodeError:
+                    logger.warning("Could not parse yt-dlp JSON output")
+                    return 'unknown'
+        
+        except Exception as e:
+            logger.error(f"Error detecting media type: {e}")
+            return 'unknown'
+    
+    def download_video(self, url: str, format_type: str = 'mp4') -> Optional[str]:
         """
-        Download image(s) from a URL without using yt-dlp's download path.
-
-        How it works:
-          1. yt-dlp extracts_info (skip_download=True) → gives us direct image URLs
-          2. httpx downloads each image URL directly
-          This completely avoids yt-dlp's format-selection/merging logic, which
-          fails on photo posts with "No video formats found."
-
-        Returns list of {filepath, size_mb} dicts (one per image in a carousel).
+        Download media as MP4 video or MP3 audio
+        
+        Args:
+            url: Direct link to Instagram video, Twitter video, YouTube, etc.
+            format_type: 'mp4' for video, 'mp3' for audio
+            
+        Returns:
+            Path to downloaded file or None if failed
         """
-        ts = int(time.time())
-
-        # ── Step 1: extract direct URL(s) via yt-dlp ─────────────────────────
-        ydl_opts = {
-            "quiet"         : True,
-            "no_warnings"   : True,
-            "skip_download" : True,   # <-- critical: do NOT attempt to download
-            "socket_timeout": 20,
-            "http_headers"  : _COMMON_HEADERS,
-        }
-        if cookies_file and os.path.isfile(cookies_file):
-            ydl_opts["cookiefile"] = cookies_file
-
-        loop = asyncio.get_event_loop()
-
-        def _extract():
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                return ydl.extract_info(url, download=False)
-
-        info = await loop.run_in_executor(None, _extract)
-
-        # Collect all entries (playlist = carousel, single entry = one photo)
-        if info.get("_type") == "playlist":
-            entries = [e for e in (info.get("entries") or []) if e]
+        try:
+            timestamp = int(time.time())
+            
+            if format_type == 'mp3':
+                output_file = self.download_dir / f"audio_{timestamp}.mp3"
+                cmd = [
+                    'yt-dlp',
+                    '--extract-audio',
+                    '--audio-format', 'mp3',
+                    '--audio-quality', '192',
+                    '--format', 'bestaudio',
+                    '--output', str(output_file),
+                    '--quiet',
+                    '--no-warnings',
+                    url
+                ]
+            else:  # mp4
+                output_file = self.download_dir / f"video_{timestamp}.mp4"
+                cmd = [
+                    'yt-dlp',
+                    '--format', 'best[ext=mp4]/best',
+                    '--output', str(output_file),
+                    '--quiet',
+                    '--no-warnings',
+                    url
+                ]
+            
+            logger.info(f"Downloading {format_type.upper()}: {url}")
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            
+            if result.returncode == 0 and output_file.exists():
+                file_size = os.path.getsize(output_file)
+                logger.info(f"Downloaded: {output_file} ({file_size / (1024*1024):.1f} MB)")
+                return str(output_file)
+            else:
+                logger.error(f"Download failed: {result.stderr}")
+                return None
+                
+        except subprocess.TimeoutExpired:
+            logger.error("Download timeout (5 minutes)")
+            return None
+        except Exception as e:
+            logger.error(f"Video download error: {e}")
+            return None
+    
+    def download_photo(self, url: str) -> Optional[list]:
+        """
+        Download photo(s) from Instagram post
+        Handles single photos and carousels (multi-image posts)
+        
+        Args:
+            url: Instagram photo/carousel URL
+            
+        Returns:
+            List of file paths or None if failed
+        """
+        try:
+            timestamp = int(time.time())
+            
+            # Extract photo URLs using yt-dlp with special handling
+            cmd = [
+                'yt-dlp',
+                '--dump-json',
+                '--skip-download',
+                '--ignore-no-formats-error',
+                '--socket-timeout', '15',
+                url
+            ]
+            
+            logger.info(f"Extracting photo URLs: {url}")
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            
+            if result.returncode != 0:
+                logger.error(f"Failed to extract photo info: {result.stderr}")
+                return None
+            
+            import json
+            try:
+                info = json.loads(result.stdout)
+            except:
+                logger.error("Could not parse JSON output")
+                return None
+            
+            photo_urls = []
+            
+            # Handle carousel (playlist of photos)
+            if info.get('_type') == 'playlist':
+                entries = info.get('entries', [])
+                logger.info(f"Found carousel with {len(entries)} items")
+                for i, entry in enumerate(entries):
+                    url_from_entry = entry.get('url') or entry.get('webpage_url')
+                    if url_from_entry:
+                        photo_urls.append(url_from_entry)
+            
+            # Handle single photo
+            else:
+                photo_url = info.get('url')
+                if photo_url:
+                    photo_urls.append(photo_url)
+            
+            if not photo_urls:
+                logger.error("No photo URLs found")
+                return None
+            
+            # Download each photo using wget or curl (direct download)
+            downloaded_files = []
+            
+            for i, photo_url in enumerate(photo_urls[:10]):  # Limit to 10 photos
+                try:
+                    # Determine file extension
+                    ext = 'jpg'
+                    if '.png' in photo_url:
+                        ext = 'png'
+                    elif '.webp' in photo_url:
+                        ext = 'webp'
+                    elif '.gif' in photo_url:
+                        ext = 'gif'
+                    
+                    file_path = self.download_dir / f"photo_{timestamp}_{i+1:02d}.{ext}"
+                    
+                    # Download with curl (more reliable for images)
+                    download_cmd = [
+                        'curl',
+                        '-L',
+                        '-o', str(file_path),
+                        '--connect-timeout', '10',
+                        '--max-time', '30',
+                        '-A', 'Mozilla/5.0',
+                        photo_url
+                    ]
+                    
+                    result = subprocess.run(download_cmd, capture_output=True, timeout=35)
+                    
+                    if result.returncode == 0 and file_path.exists():
+                        size_mb = os.path.getsize(file_path) / (1024 * 1024)
+                        logger.info(f"Downloaded photo {i+1}: {file_path} ({size_mb:.2f} MB)")
+                        downloaded_files.append(str(file_path))
+                    else:
+                        logger.warning(f"Failed to download photo {i+1}")
+                
+                except Exception as e:
+                    logger.error(f"Error downloading photo {i+1}: {e}")
+            
+            if not downloaded_files:
+                logger.error("No photos were successfully downloaded")
+                return None
+            
+            return downloaded_files
+        
+        except Exception as e:
+            logger.error(f"Photo download error: {e}")
+            return None
+    
+    def download(self, url: str, format_type: str = 'mp4') -> Optional[Union[str, list]]:
+        """
+        Auto-detect and download (video or photo)
+        
+        Returns:
+            - For videos/audio: str (file path)
+            - For photos: list (file paths)
+            - None if failed
+        """
+        logger.info(f"Auto-detecting media type for: {url}")
+        media_type = self.detect_media_type(url)
+        logger.info(f"Detected type: {media_type}")
+        
+        if media_type == 'photo':
+            return self.download_photo(url)
         else:
-            entries = [info]
-
-        if not entries:
-            raise ValueError("No media entries found for this URL.")
-
-        # ── Step 2: download each image directly with httpx ───────────────────
-        results = []
-
-        async with httpx.AsyncClient(
-            headers=_COMMON_HEADERS,
-            follow_redirects=True,
-            timeout=30.0,
-        ) as client:
-            for i, entry in enumerate(entries):
-                img_url, ext = _best_image_url(entry)
-
-                if not img_url:
-                    logger.warning("No image URL found for entry %d — skipping", i + 1)
-                    continue
-
-                filepath = self.downloads_dir / f"{user_id}_{ts}_{i+1:02d}.{ext}"
-
-                try:
-                    resp = await client.get(img_url)
-                    resp.raise_for_status()
-                    filepath.write_bytes(resp.content)
-
-                    size_mb = filepath.stat().st_size / (1024 * 1024)
-                    self._add_usage(user_id, size_mb)
-                    results.append({"filepath": str(filepath), "size_mb": size_mb})
-                    logger.info(
-                        "Image %d/%d downloaded — %.2f MB", i + 1, len(entries), size_mb
-                    )
-
-                except Exception as exc:
-                    logger.error("Failed to download image %d: %s", i + 1, exc)
-
-        if not results:
-            raise FileNotFoundError(
-                "No images could be downloaded from this post.\n"
-                "If it's a private account, add login cookies and try again."
-            )
-
-        return results
-
-    # ── Shared helpers ────────────────────────────────────────────────────────
-
-    @staticmethod
-    def _safe_progress(
-        loop: asyncio.AbstractEventLoop,
-        callback: Callable[[float], None],
-        pct: float,
-    ) -> None:
+            return self.download_video(url, format_type)
+    
+    def cleanup(self, filepath: str) -> None:
+        """Delete a file"""
         try:
-            loop.call_soon_threadsafe(callback, pct)
-        except Exception as exc:
-            logger.warning("Could not schedule progress update: %s", exc)
-
-    def cleanup(self, filepath: Optional[str]) -> None:
-        if filepath and os.path.isfile(filepath):
-            try:
+            if filepath and os.path.exists(filepath):
                 os.remove(filepath)
-                logger.info("Cleaned up %s", filepath)
-            except Exception as exc:
-                logger.warning("Cleanup failed for %s: %s", filepath, exc)
-
-    def cleanup_list(self, results: list) -> None:
-        for r in results:
-            self.cleanup(r.get("filepath"))
-
-    # ── Internal ──────────────────────────────────────────────────────────────
-
-    def _find_file(self, directory: Path, uid: int, ts: int, ext: str) -> Optional[str]:
-        prefix = f"{uid}_{ts}"
-        for f in directory.iterdir():
-            if f.stem == prefix or f.name.startswith(prefix):
-                return str(f)
-        for f in sorted(
-            directory.glob(f"*.{ext}"),
-            key=lambda x: x.stat().st_mtime,
-            reverse=True,
-        ):
-            if str(uid) in f.name:
-                return str(f)
-        return None
-
-    def _ensure_fresh(self, uid: int) -> None:
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        rec   = self._usage.get(uid)
-        if not rec or rec["date"] != today:
-            self._usage[uid] = {"date": today, "used_mb": 0.0}
-
-    def _add_usage(self, uid: int, mb: float) -> None:
-        self._ensure_fresh(uid)
-        self._usage[uid]["used_mb"] += mb
-        self._save_usage()
-
-    def _load_usage(self) -> None:
-        if self._usage_file.exists():
-            try:
-                with open(self._usage_file) as f:
-                    raw = json.load(f)
-                self._usage = {int(k): v for k, v in raw.items()}
-                logger.info("Loaded usage data for %d users.", len(self._usage))
-            except Exception as exc:
-                logger.warning("Could not load usage file: %s", exc)
-
-    def _save_usage(self) -> None:
-        try:
-            with open(self._usage_file, "w") as f:
-                json.dump(self._usage, f, indent=2)
-        except Exception as exc:
-            logger.warning("Could not save usage file: %s", exc)
+                logger.info(f"Cleaned up: {filepath}")
+        except Exception as e:
+            logger.error(f"Cleanup error: {e}")
+    
+    def cleanup_list(self, filepaths: list) -> None:
+        """Delete multiple files"""
+        for fp in filepaths:
+            self.cleanup(fp)
