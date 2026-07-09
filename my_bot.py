@@ -26,7 +26,13 @@ logger = logging.getLogger(__name__)
 # CONFIGURATION
 # ============================================
 
-TOKEN = 'YOUR_BOT_TOKEN_HERE'  # 🔴 REPLACE WITH YOUR TOKEN
+# ============================================
+# CONFIGURATION
+# ============================================
+
+# This pulls the token securely from Railway's environment variables
+import os
+TOKEN = os.getenv('BOT_TOKEN')
 
 os.makedirs("downloads", exist_ok=True)
 
