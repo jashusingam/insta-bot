@@ -1,19 +1,11 @@
-"""
-Complete Telegram Media Downloader Bot
-Download MP4/MP3 from Instagram, Twitter/X, YouTube, TikTok, and 900+ sites
-HANDLES BOTH VIDEOS AND PHOTOS CORRECTLY
-"""
-
-import os
-import logging
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.ext import (
     Application, MessageHandler, ContextTypes, filters, 
     CallbackQueryHandler, CommandHandler
 )
-# Fixed the ModuleNotFoundError import statement here:
 from download_handler import MediaDownloader
-from metadata_handler import MetadataHandler
+import os
+import logging
 
 # Setup logging
 logging.basicConfig(
@@ -23,25 +15,40 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ============================================
-# CONFIGURATION
+# CONFIGURATION (Railway Environment Variables)
 # ============================================
 
-# ============================================
-# CONFIGURATION
-# ============================================
+# Reads the token uploaded as a Railway variable named BOT_TOKEN
+TOKEN = os.environ.get('BOT_TOKEN', 'YOUR_BOT_TOKEN_HERE')
 
-# This pulls the token securely from Railway's environment variables
-import os
-TOKEN = os.getenv('BOT_TOKEN')
+# Reads a comma-separated string of user IDs from Railway (e.g., "123456,789012")
+ALLOWED_USERS_RAW = os.environ.get('ALLOWED_USERS', '')
+ALLOWED_USERS = {1362997526, 7509064576}
+
+if ALLOWED_USERS_RAW:
+    try:
+        ALLOWED_USERS = {int(uid.strip()) for uid in ALLOWED_USERS_RAW.split(',') if uid.strip()}
+        logger.info(f"🔒 Bot locked to specific users: {ALLOWED_USERS}")
+    except ValueError:
+        logger.error("❌ Failed to parse ALLOWED_USERS variable. Ensure it's a comma-separated list of numbers.")
 
 os.makedirs("downloads", exist_ok=True)
 
-# Initialize handlers
+# Initialize downloader
 downloader = MediaDownloader()
-metadata_helper = MetadataHandler()
 
 # Store URLs in memory (user_id_message_id -> url)
 user_urls = {}
+
+# ============================================
+# ACCESS CONTROL HELPER
+# ============================================
+
+def is_user_allowed(user_id: int) -> bool:
+    """Check if the user is authorized to use the bot"""
+    if not ALLOWED_USERS:
+        return True  # If the variable isn't set, anyone can use it
+    return user_id in ALLOWED_USERS
 
 # ============================================
 # COMMAND HANDLERS
@@ -49,6 +56,10 @@ user_urls = {}
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start command"""
+    if not is_user_allowed(update.effective_user.id):
+        await update.message.reply_text("⛔ Sorry, you do not have permission to use this bot.")
+        return
+
     await update.message.reply_text(
         "👋 Welcome to Media Downloader Bot!\n\n"
         "📱 Send me a link from:\n"
@@ -66,6 +77,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /help command"""
+    if not is_user_allowed(update.effective_user.id):
+        await update.message.reply_text("⛔ Sorry, you do not have permission to use this bot.")
+        return
+
     await update.message.reply_text(
         "📖 How to Use:\n\n"
         "1️⃣ Send me a direct URL/link\n"
@@ -94,9 +109,14 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     Handle when user sends a link
     Detect if it's video or photo and respond accordingly
     """
-    url = update.message.text.strip()
+    user_id = update.message.from_user.id
     
-    logger.info(f"User {update.message.from_user.id} sent URL: {url}")
+    if not is_user_allowed(user_id):
+        await update.message.reply_text("⛔ Sorry, you do not have permission to use this bot.")
+        return
+
+    url = update.message.text.strip()
+    logger.info(f"User {user_id} sent URL: {url}")
     
     # Validate URL
     if not url.startswith(('http://', 'https://')):
@@ -119,7 +139,6 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"Detected media type: {media_type}")
     
     # Store URL
-    user_id = update.message.from_user.id
     message_id = update.message.message_id
     request_key = f"{user_id}_{message_id}"
     user_urls[request_key] = url
@@ -137,17 +156,9 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
-        # Pull rich info from Metadata Handler if supported
-        try:
-            meta = await metadata_helper.fetch_metadata(url)
-            caption = metadata_helper.format_meta_message(meta) + "\n\n📥 Choose download format:"
-        except Exception:
-            caption = "📥 Choose download format:"
-
         await status_msg.edit_text(
-            text=caption,
-            reply_markup=reply_markup,
-            parse_mode="HTML"
+            "📥 Choose download format:",
+            reply_markup=reply_markup
         )
 
 
@@ -187,14 +198,20 @@ async def handle_photo_download(status_msg, url: str, user_id: int):
         else:
             # Multiple photos (carousel)
             media_group = []
-            for i, file_path in enumerate(files[:10]):  # Max 10
-                with open(file_path, 'rb') as f:
-                    content = f.read()
-                    media_group.append(InputMediaPhoto(content))
+            opened_files = []
             
-            if media_group:
-                await status_msg.message.reply_media_group(media_group)
-                await status_msg.message.reply_text(f"✅ Carousel with {len(files)} photos downloaded!")
+            try:
+                for file_path in files[:10]:  # Max 10
+                    f = open(file_path, 'rb')
+                    opened_files.append(f)
+                    media_group.append(InputMediaPhoto(f))
+                
+                if media_group:
+                    await status_msg.message.reply_media_group(media_group)
+                    await status_msg.edit_text(f"✅ Carousel with {len(files)} photos downloaded!")
+            finally:
+                for f in opened_files:
+                    f.close()
         
         await status_msg.delete()
         
@@ -215,6 +232,11 @@ async def handle_format_choice(update: Update, context: ContextTypes.DEFAULT_TYP
     query = update.callback_query
     await query.answer()
     
+    # Enforce access control on interactive query buttons
+    if not is_user_allowed(query.from_user.id):
+        await query.edit_message_text("⛔ Sorry, you do not have permission to use this bot.")
+        return
+
     # Parse callback data
     data = query.data.split('_', 1)
     format_type = data[0]  # 'mp4' or 'mp3'
@@ -339,9 +361,8 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     """Start the bot"""
     
-    # Check if token is set
-    if TOKEN == 'YOUR_BOT_TOKEN_HERE':
-        print("❌ ERROR: Please set your TELEGRAM_BOT_TOKEN!")
+    if TOKEN == 'YOUR_BOT_TOKEN_HERE' or not TOKEN:
+        print("❌ ERROR: Please set your BOT_TOKEN inside Railway Variables!")
         return
     
     # Create bot application
