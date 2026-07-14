@@ -10,36 +10,36 @@ import yt_dlp
 
 logger = logging.getLogger(__name__)
 
+# Supported Instagram URL patterns
 INSTAGRAM_PATTERNS = [
     r"https?://(www\.)?instagram\.com/(reel|p|tv|share)/[\w\-]+/?",
     r"https?://instagr\.am/(reel|p|tv|share)/[\w\-]+/?",
 ]
 
+# Supported Twitter / X URL patterns
 TWITTER_PATTERNS = [
     r"https?://(www\.)?(twitter|x)\.com/\w+/status/\d+",
     r"https?://(www\.)?(twitter|x)\.com/i/status/\d+",
     r"https?://t\.co/[\w]+",
 ]
 
-IMAGE_EXTS   = {'jpg', 'jpeg', 'png', 'webp', 'gif'}
-VIDEO_EXTS   = {'mp4', 'webm', 'mkv', 'mov', 'avi', 'flv', 'm4v'}
-
-_COMMON_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    )
-}
+IMAGE_EXTS = {'jpg', 'jpeg', 'png', 'webp', 'gif'}
 
 
 class MetadataHandler:
+    """Validates Instagram/Twitter URLs and fetches video/photo metadata via yt-dlp."""
 
     def is_instagram_url(self, text: str) -> bool:
-        return any(re.search(p, text) for p in INSTAGRAM_PATTERNS)
+        for pattern in INSTAGRAM_PATTERNS:
+            if re.search(pattern, text):
+                return True
+        return False
 
     def is_twitter_url(self, text: str) -> bool:
-        return any(re.search(p, text) for p in TWITTER_PATTERNS)
+        for pattern in TWITTER_PATTERNS:
+            if re.search(pattern, text):
+                return True
+        return False
 
     def is_supported_url(self, text: str) -> bool:
         return self.is_instagram_url(text) or self.is_twitter_url(text)
@@ -52,13 +52,23 @@ class MetadataHandler:
         return "unknown"
 
     async def fetch_metadata(self, url: str, cookies_file: Optional[str] = None) -> dict:
+        """
+        Fetch metadata for an Instagram or Twitter/X URL.
+        Works for videos, single photos, and carousels.
+        Returns a normalised dict — check meta['is_photo'] to branch your logic.
+        """
         ydl_opts = {
-            "quiet"                 : True,
-            "no_warnings"           : True,
-            "skip_download"         : True,
-            "socket_timeout"        : 20,
-            "http_headers"          : _COMMON_HEADERS,
-            "ignore_no_formats_error": True,
+            "quiet"        : True,
+            "no_warnings"  : True,
+            "skip_download": True,
+            "socket_timeout": 20,
+            "http_headers" : {
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                )
+            },
         }
         if cookies_file:
             import os
@@ -77,7 +87,10 @@ class MetadataHandler:
     # ── Private ───────────────────────────────────────────────────────────────
 
     def _normalise(self, info: dict) -> dict:
+        """Convert raw yt-dlp info dict into a clean summary."""
         duration = info.get("duration", 0) or 0
+
+        # Detect photo vs video, and how many images (carousel support)
         is_photo, photo_count = self._detect_photo(info)
 
         return {
@@ -93,56 +106,58 @@ class MetadataHandler:
             "upload_date" : self._fmt_date(info.get("upload_date") or ""),
             "webpage_url" : info.get("webpage_url") or "",
             "formats"     : self._summarise_formats(info.get("formats") or []),
+            # Photo-specific fields
             "is_photo"    : is_photo,
             "photo_count" : photo_count,
         }
 
     @staticmethod
     def _detect_photo(info: dict) -> tuple:
+        """
+        Detect whether this is a photo/image post vs a video.
+        Returns (is_photo: bool, photo_count: int).
+
+        Handles:
+          - Single Instagram/Twitter photo
+          - Instagram carousel (multiple photos)
+          - Twitter tweet with multiple images
+        """
+        # ── Playlist / carousel ──────────────────────────────────────────────
         if info.get("_type") == "playlist":
             entries = [e for e in (info.get("entries") or []) if e]
-            image_entries = 0
+            image_entries = []
             for entry in entries:
-                ext     = (entry.get("ext") or "").lower()
-                url_str = entry.get("url") or ""
-                url_ext = url_str.split("?")[0].rsplit(".", 1)[-1].lower() if "." in url_str else ""
+                ext = (entry.get("ext") or "").lower()
                 formats = entry.get("formats") or []
-                has_real_video = any(
+                # Has a real video stream?
+                has_video = any(
                     f.get("vcodec", "none") not in ("none", None, "")
                     for f in formats
                 )
-                is_video_ext = ext in VIDEO_EXTS
-                is_image_ext = ext in IMAGE_EXTS or url_ext in IMAGE_EXTS
-
-                if is_image_ext or (not has_real_video and not is_video_ext):
-                    image_entries += 1
-
-            if image_entries > 0:
-                return True, image_entries
+                if not has_video and (ext in IMAGE_EXTS or not formats):
+                    image_entries.append(entry)
+            if image_entries:
+                return True, len(image_entries)
+            # If entries exist but none matched image heuristic, it's a video playlist
             return False, 0
 
-        ext = (info.get("ext") or "").lower()
-        if ext in IMAGE_EXTS:
-            return True, 1
-        if ext in VIDEO_EXTS:
-            return False, 0
-
-        top_url = info.get("url") or ""
-        if top_url:
-            url_ext = top_url.split("?")[0].rsplit(".", 1)[-1].lower()
-            if url_ext in IMAGE_EXTS:
-                return True, 1
-
+        # ── Single entry ─────────────────────────────────────────────────────
         formats = info.get("formats") or []
         if formats:
-            has_real_video = any(
+            has_video = any(
                 f.get("vcodec", "none") not in ("none", None, "")
                 for f in formats
             )
-            if not has_real_video:
-                return True, 1
+            if not has_video:
+                has_image = any(
+                    f.get("ext", "").lower() in IMAGE_EXTS for f in formats
+                )
+                if has_image:
+                    return True, 1
 
-        if not formats and ext not in VIDEO_EXTS:
+        # Fall back to top-level ext
+        ext = (info.get("ext") or "").lower()
+        if ext in IMAGE_EXTS:
             return True, 1
 
         return False, 0
@@ -156,7 +171,9 @@ class MetadataHandler:
     def _fmt_duration(seconds: int) -> str:
         m, s = divmod(int(seconds), 60)
         h, m = divmod(m, 60)
-        return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+        if h:
+            return f"{h}:{m:02d}:{s:02d}"
+        return f"{m}:{s:02d}"
 
     @staticmethod
     def _fmt_date(raw: str) -> str:
@@ -172,9 +189,10 @@ class MetadataHandler:
     def _summarise_formats(formats: list) -> list:
         seen, out = set(), []
         for f in formats:
-            w, h  = f.get("width"), f.get("height")
-            ext   = f.get("ext", "?")
-            key   = f"{w}x{h}"
+            w = f.get("width")
+            h = f.get("height")
+            ext = f.get("ext", "?")
+            key = f"{w}x{h}"
             if key not in seen and w and h:
                 seen.add(key)
                 out.append({
@@ -184,8 +202,11 @@ class MetadataHandler:
                 })
         return out
 
+    # ── Message formatters ────────────────────────────────────────────────────
+
     @staticmethod
-    def format_meta_message(meta: dict, used_mb: float = 0, max_mb: float = 100) -> str:
+    def format_meta_message(meta: dict, used_mb: float, max_mb: float) -> str:
+        """Build the HTML caption shown above the quality keyboard (video flow)."""
         lines = [f"🎬 <b>{meta['title']}</b>", f"👤  @{meta['uploader']}"]
         if meta["duration"]:
             lines.append(f"⏱  Duration: <code>{meta['duration_str']}</code>")
@@ -195,10 +216,18 @@ class MetadataHandler:
             lines.append(f"👁  Views: {meta['view_count']:,}")
         if meta["like_count"] is not None:
             lines.append(f"❤️  Likes: {meta['like_count']:,}")
+        remaining = max(0, max_mb - used_mb)
+        lines += [
+            "",
+            f"📊  Daily quota: <b>{used_mb:.1f} / {max_mb} MB</b>  (left: {remaining:.1f} MB)",
+            "",
+            "🎚  <b>Choose quality:</b>",
+        ]
         return "\n".join(lines)
 
     @staticmethod
-    def format_photo_message(meta: dict, used_mb: float = 0, max_mb: float = 100) -> str:
+    def format_photo_message(meta: dict, used_mb: float, max_mb: float) -> str:
+        """Build the HTML caption shown while downloading a photo."""
         count = meta.get("photo_count", 1)
         label = f"{count} photo{'s' if count > 1 else ''}"
         lines = [
@@ -210,4 +239,11 @@ class MetadataHandler:
             lines.append(f"📅  Uploaded: {meta['upload_date']}")
         if meta["like_count"] is not None:
             lines.append(f"❤️  Likes: {meta['like_count']:,}")
+        remaining = max(0, max_mb - used_mb)
+        lines += [
+            "",
+            f"📊  Daily quota: <b>{used_mb:.1f} / {max_mb} MB</b>  (left: {remaining:.1f} MB)",
+            "",
+            "⏳  Downloading…",
+        ]
         return "\n".join(lines)
