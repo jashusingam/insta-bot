@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 
 # ─── Config ─────────────────────────────────────────────────────────────────
 BOT_TOKEN     = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
-ALLOWED_USERS = {1362997526, 7509064576} 
+ALLOWED_USERS = {1362997526, 7509064576,1531684547} 
 MAX_DAILY_MB  = 1024
 DOWNLOADS_DIR = "downloads"
 COOKIES_FILE  = os.path.join(DOWNLOADS_DIR, "cookies.txt")
