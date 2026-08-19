@@ -1,12 +1,15 @@
 """
 Advanced Instagram & Twitter/X Downloader Telegram Bot
-my_bot.py — Main entry point
+my_bot.py — Main entry point (Koyeb-compatible with background health check)
 Supports: videos (HD/SD/Audio), single photos, carousels (multi-image posts)
 """
 
 import os
 import logging
 import asyncio
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
 from telegram import Update, BotCommand, InputMediaPhoto
 from telegram.ext import (
     Application,
@@ -28,10 +31,29 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ─── Koyeb Health Check HTTP Server ───────────────────────────────────────────
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    """Responds to Koyeb's HTTP health checks and external uptime pings."""
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"Bot is healthy and running!")
+
+    def log_message(self, format, *args):
+        # Suppress repeated ping logs to keep bot output clean
+        return
+
+def start_health_server():
+    port = int(os.getenv("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+    logger.info(f"Health check server running on port {port}")
+    server.serve_forever()
+
 # ─── Config ─────────────────────────────────────────────────────────────────
 BOT_TOKEN     = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
-ALLOWED_USERS = {1362997526, 7509064576,1531684547} 
-MAX_DAILY_MB  = 1024
+ALLOWED_USERS = {1362997526, 7509064576, 1531684547} 
+MAX_DAILY_MB  = int(os.getenv("MAX_DAILY_MB", "1024"))
 DOWNLOADS_DIR = "downloads"
 COOKIES_FILE  = os.path.join(DOWNLOADS_DIR, "cookies.txt")
 
@@ -202,6 +224,10 @@ async def post_init(application: Application) -> None:
     logger.info("Bot commands registered.")
 
 def main() -> None:
+    # 1. Start the HTTP server on a daemon thread for Koyeb health checks
+    threading.Thread(target=start_health_server, daemon=True).start()
+
+    # 2. Build and launch Telegram Bot Application
     app = (
         Application.builder()
         .token(BOT_TOKEN)
@@ -217,7 +243,7 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
     app.add_handler(CallbackQueryHandler(handle_callback))
 
-    logger.info("Bot is running…")
+    logger.info("Bot polling is active…")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
