@@ -1,10 +1,11 @@
 """
 Advanced Instagram & Twitter/X Downloader Telegram Bot
-my_bot.py — Main entry point (Koyeb-compatible with background health check)
+my_bot.py — Main entry point (Render / Koyeb compatible with background health server)
 Supports: videos (HD/SD/Audio), single photos, carousels (multi-image posts)
 """
 
 import os
+import sys
 import logging
 import asyncio
 import threading
@@ -27,31 +28,35 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
     level=logging.INFO,
-    handlers=[logging.FileHandler("bot.log"), logging.StreamHandler()],
+    handlers=[logging.FileHandler("bot.log"), logging.StreamHandler(sys.stdout)],
 )
 logger = logging.getLogger(__name__)
 
-# ─── Koyeb Health Check HTTP Server ───────────────────────────────────────────
+# ─── Web Service Health Check Server ─────────────────────────────────────────
 class HealthCheckHandler(BaseHTTPRequestHandler):
-    """Responds to Koyeb's HTTP health checks and external uptime pings."""
+    """Responds to Render/Koyeb HTTP health checks and keep-alive pings."""
     def do_GET(self):
         self.send_response(200)
         self.send_header("Content-type", "text/plain")
         self.end_headers()
-        self.wfile.write(b"Bot is healthy and running!")
+        self.wfile.write(b"Bot is online and healthy!")
 
     def log_message(self, format, *args):
-        # Suppress repeated ping logs to keep bot output clean
+        # Suppress routine GET ping logs to keep the console readable
         return
 
 def start_health_server():
-    port = int(os.getenv("PORT", 8080))
+    port = int(os.getenv("PORT", 10000))
     server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
     logger.info(f"Health check server running on port {port}")
     server.serve_forever()
 
-# ─── Config ─────────────────────────────────────────────────────────────────
-BOT_TOKEN     = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+# ─── Config & Validation ────────────────────────────────────────────────────
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+if not BOT_TOKEN or BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
+    logger.error("CRITICAL: BOT_TOKEN environment variable is missing or invalid!")
+    sys.exit(1)
+
 ALLOWED_USERS = {1362997526, 7509064576, 1531684547} 
 MAX_DAILY_MB  = int(os.getenv("MAX_DAILY_MB", "1024"))
 DOWNLOADS_DIR = "downloads"
@@ -148,13 +153,18 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     context.user_data["pending_url"]  = text
     context.user_data["pending_meta"] = meta
     keyboard = download_handler.build_quality_keyboard(meta, uid)
-    await status_msg.edit_text(metadata_handler.format_meta_message(meta, used, MAX_DAILY_MB),
-                               parse_mode="HTML", reply_markup=keyboard)
+    await status_msg.edit_text(
+        metadata_handler.format_meta_message(meta, used, MAX_DAILY_MB),
+        parse_mode="HTML",
+        reply_markup=keyboard
+    )
 
 async def _handle_photo(update, context, status_msg, url, meta, uid):
     used = download_handler.get_daily_usage(uid)
-    await status_msg.edit_text(metadata_handler.format_photo_message(meta, used, MAX_DAILY_MB),
-                               parse_mode="HTML")
+    await status_msg.edit_text(
+        metadata_handler.format_photo_message(meta, used, MAX_DAILY_MB),
+        parse_mode="HTML"
+    )
     try:
         results = await download_handler.download_image(url, uid, COOKIES_FILE)
     except Exception as exc:
@@ -164,13 +174,20 @@ async def _handle_photo(update, context, status_msg, url, meta, uid):
     await status_msg.edit_text("📤 Sending…")
     caption = f"🖼 <b>{meta.get('title','Photo')}</b>\n👤 @{meta.get('uploader','unknown')}\n🔗 <a href='{url}'>Original</a>"
     if len(results) == 1:
-        await update.message.reply_photo(photo=open(results[0]["filepath"], "rb"),
-                                         caption=caption, parse_mode="HTML")
+        await update.message.reply_photo(
+            photo=open(results[0]["filepath"], "rb"),
+            caption=caption,
+            parse_mode="HTML"
+        )
     else:
-        media_group = [InputMediaPhoto(open(r["filepath"], "rb"),
-                                       caption=caption if i==0 else None,
-                                       parse_mode="HTML" if i==0 else None)
-                       for i,r in enumerate(results[:10])]
+        media_group = [
+            InputMediaPhoto(
+                open(r["filepath"], "rb"),
+                caption=caption if i == 0 else None,
+                parse_mode="HTML" if i == 0 else None
+            )
+            for i, r in enumerate(results[:10])
+        ]
         await update.message.reply_media_group(media_group)
     await status_msg.delete()
     download_handler.cleanup_list(results)
@@ -180,7 +197,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await query.answer()
     uid = query.from_user.id
     data = query.data
-    if not data.startswith("dl:"): return
+    if not data.startswith("dl:"):
+        return
     quality = data[3:]
     url  = context.user_data.get("pending_url")
     meta = context.user_data.get("pending_meta")
@@ -192,7 +210,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.edit_message_text("❌ Cancelled.")
         return
     await query.edit_message_text(f"⏳ Downloading {quality.upper()}…", parse_mode="HTML")
-    def _on_progress(p): asyncio.create_task(query.edit_message_text(f"📥 {p:.1f}% done", parse_mode="HTML"))
+    def _on_progress(p):
+        asyncio.create_task(query.edit_message_text(f"📥 {p:.1f}% done", parse_mode="HTML"))
     try:
         result = await download_handler.download(url, quality, uid, COOKIES_FILE, _on_progress)
     except Exception as exc:
@@ -200,12 +219,25 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
     await query.edit_message_text("📤 Uploading…")
     caption = f"📹 <b>{meta.get('title','Video')}</b>\n👤 @{meta.get('uploader','unknown')}\n📦 {result['size_mb']:.2f} MB | {quality.upper()}"
-    if quality=="audio":
-        await query.message.reply_audio(audio=open(result["filepath"],"rb"),caption=caption,parse_mode="HTML")
+    if quality == "audio":
+        await query.message.reply_audio(
+            audio=open(result["filepath"], "rb"),
+            caption=caption,
+            parse_mode="HTML"
+        )
     else:
-        await query.message.reply_video(video=open(result["filepath"],"rb"),caption=caption,parse_mode="HTML",supports_streaming=True)
+        await query.message.reply_video(
+            video=open(result["filepath"], "rb"),
+            caption=caption,
+            parse_mode="HTML",
+            supports_streaming=True
+        )
     await query.delete_message()
     download_handler.cleanup(result.get("filepath"))
+
+# ── Error Handler ───────────────────────────────────────────────────────────
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.error("Exception while handling an update:", exc_info=context.error)
 
 # ── Helper ────────────────────────────────────────────────────────────────
 def _progress_bar(pct: float, width: int = 10) -> str:
@@ -221,13 +253,13 @@ async def post_init(application: Application) -> None:
         BotCommand("cancel", "Cancel current download"),
         BotCommand("about",  "Bot info"),
     ])
-    logger.info("Bot commands registered.")
+    logger.info("Bot commands registered successfully.")
 
 def main() -> None:
-    # 1. Start the HTTP server on a daemon thread for Koyeb health checks
+    # 1. Start background HTTP server for health checks
     threading.Thread(target=start_health_server, daemon=True).start()
 
-    # 2. Build and launch Telegram Bot Application
+    # 2. Build Telegram bot application
     app = (
         Application.builder()
         .token(BOT_TOKEN)
@@ -242,9 +274,14 @@ def main() -> None:
     app.add_handler(CommandHandler("about",  cmd_about))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
     app.add_handler(CallbackQueryHandler(handle_callback))
+    app.add_error_handler(error_handler)
 
     logger.info("Bot polling is active…")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    # drop_pending_updates=True clears old Railway hooks and conflict states
+    app.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True
+    )
 
 if __name__ == "__main__":
     main()
